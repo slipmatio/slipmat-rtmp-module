@@ -45,6 +45,7 @@ typedef struct {
 typedef struct {
     ngx_rtmp_record_app_conf_t         *conf;
     ngx_file_t                          file;
+    ngx_fd_t                            key_fd;
     u_char                              key[NGX_RTMP_RECORD_KEY_MAX + 1];
     ngx_uint_t                          part;
     ngx_uint_t                          nframes;
@@ -85,6 +86,8 @@ ngx_int_t ngx_rtmp_record_open_key(ngx_rtmp_session_t *s, ngx_uint_t n,
 ngx_int_t ngx_rtmp_record_close_key(ngx_rtmp_session_t *s, ngx_uint_t n,
           ngx_str_t *key, ngx_str_t *path);
 ngx_int_t ngx_rtmp_record_valid_key(ngx_str_t *key);
+ngx_int_t ngx_rtmp_record_seal_key(ngx_rtmp_record_app_conf_t *racf,
+          ngx_str_t *key, ngx_log_t *log);
 
 void ngx_rtmp_record_get_path(ngx_rtmp_session_t *s,
     ngx_rtmp_record_rec_ctx_t *rctx, ngx_str_t *path);

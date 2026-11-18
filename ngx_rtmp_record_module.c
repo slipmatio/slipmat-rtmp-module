@@ -605,6 +605,129 @@ ngx_rtmp_record_append_offset(ngx_rtmp_record_rec_ctx_t *rctx)
 }
 
 
+/* The state inode outlives every FLV and the MP3. Never unlink it. */
+static ngx_fd_t
+ngx_rtmp_record_key_file(ngx_rtmp_record_app_conf_t *racf, ngx_str_t *key,
+    ngx_log_t *log)
+{
+    u_char    path[NGX_MAX_PATH];
+    ngx_fd_t  fd;
+
+    ngx_sprintf(path, "%V/%V.state%Z", &racf->path, key);
+    fd = ngx_open_file(path, NGX_FILE_RDWR, NGX_FILE_CREATE_OR_OPEN,
+                       NGX_FILE_OWNER_ACCESS);
+    if (fd == NGX_INVALID_FILE) {
+        ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                      "record: could not open key state '%s'", path);
+    }
+
+    return fd;
+}
+
+
+static ngx_int_t
+ngx_rtmp_record_lock_key(ngx_fd_t fd, ngx_log_t *log)
+{
+#if (NGX_RTMP_HAVE_FLOCK)
+    ngx_err_t  err;
+
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        return NGX_OK;
+    }
+
+    err = ngx_errno;
+    if (err == NGX_EAGAIN) {
+        return NGX_BUSY;
+    }
+    ngx_log_error(NGX_LOG_ERR, log, err, "record: could not lock key state");
+#endif
+    return NGX_ERROR;
+}
+
+
+ngx_int_t
+ngx_rtmp_record_seal_key(ngx_rtmp_record_app_conf_t *racf, ngx_str_t *key,
+    ngx_log_t *log)
+{
+    ngx_fd_t   fd;
+    ngx_int_t  rc;
+
+    if (!racf->keyed || !ngx_rtmp_record_valid_key(key)) {
+        return NGX_DECLINED;
+    }
+
+    fd = ngx_rtmp_record_key_file(racf, key, log);
+    if (fd == NGX_INVALID_FILE) {
+        return NGX_ERROR;
+    }
+
+    /* Mark first. A writer that already passed admission holds the lock
+     * until its last FLV write; every later writer sees a nonempty file. */
+    if (ngx_write_fd(fd, "1", 1) != 1) {
+        ngx_log_error(NGX_LOG_ERR, log, ngx_errno, "record: seal failed");
+        rc = NGX_ERROR;
+    } else {
+        rc = ngx_rtmp_record_lock_key(fd, log);
+    }
+
+    if (ngx_close_file(fd) == NGX_FILE_ERROR) {
+        return NGX_ERROR;
+    }
+    return rc;
+}
+
+
+static ngx_int_t
+ngx_rtmp_record_admit_key(ngx_rtmp_record_rec_ctx_t *rctx, ngx_str_t *key,
+    ngx_log_t *log)
+{
+    ngx_int_t        rc;
+    ngx_file_info_t  info;
+
+    rctx->key_fd = ngx_rtmp_record_key_file(rctx->conf, key, log);
+    if (rctx->key_fd == NGX_INVALID_FILE) {
+        return NGX_ERROR;
+    }
+
+    rc = ngx_rtmp_record_lock_key(rctx->key_fd, log);
+    if (rc == NGX_OK) {
+        if (ngx_fd_info(rctx->key_fd, &info) == NGX_FILE_ERROR) {
+            ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                          "record: could not read key state");
+            rc = NGX_ERROR;
+        } else if (ngx_file_size(&info) != 0) {
+            rc = NGX_BUSY;
+        }
+    }
+
+    if (rc != NGX_OK) {
+        ngx_close_file(rctx->key_fd);
+        rctx->key_fd = NGX_INVALID_FILE;
+    }
+    return rc;
+}
+
+
+static void
+ngx_rtmp_record_close_files(ngx_rtmp_session_t *s,
+    ngx_rtmp_record_rec_ctx_t *rctx)
+{
+    if (rctx->file.fd != NGX_INVALID_FILE) {
+        if (ngx_close_file(rctx->file.fd) == NGX_FILE_ERROR) {
+            ngx_log_error(NGX_LOG_CRIT, s->connection->log, ngx_errno,
+                          "record: %V error closing file", &rctx->conf->id);
+            ngx_rtmp_record_notify_error(s, rctx);
+        }
+        rctx->file.fd = NGX_INVALID_FILE;
+    }
+
+    if (rctx->key_fd != NGX_INVALID_FILE) {
+        ngx_close_file(rctx->key_fd);
+        rctx->key_fd = NGX_INVALID_FILE;
+    }
+}
+
+
 static ngx_int_t
 ngx_rtmp_record_node_open(ngx_rtmp_session_t *s,
     ngx_rtmp_record_rec_ctx_t *rctx, ngx_str_t *key)
@@ -636,7 +759,13 @@ ngx_rtmp_record_node_open(ngx_rtmp_session_t *s,
     rctx->last = *ngx_cached_time;
     rctx->timestamp = ngx_cached_time->sec;
 
+    rctx->file.fd = NGX_INVALID_FILE;
+    rctx->key_fd = NGX_INVALID_FILE;
     if (key) {
+        rc = ngx_rtmp_record_admit_key(rctx, key, s->connection->log);
+        if (rc != NGX_OK) {
+            return rc;
+        }
         ngx_memcpy(rctx->key, key->data, key->len);
     }
 
@@ -659,8 +788,7 @@ open_part:
 
         ngx_log_error(NGX_LOG_ERR, s->connection->log, err,
                       "record: %V failed to open '%V'", &rracf->id, &path);
-        ngx_rtmp_record_notify_error(s, rctx);
-        return NGX_ERROR;
+        goto failed;
     }
 
 #if !(NGX_WIN32)
@@ -710,8 +838,7 @@ open_part:
     return NGX_OK;
 
 failed:
-    ngx_close_file(rctx->file.fd);
-    rctx->file.fd = NGX_INVALID_FILE;
+    ngx_rtmp_record_close_files(s, rctx);
     ngx_rtmp_record_notify_error(s, rctx);
     return NGX_ERROR;
 }
@@ -767,6 +894,7 @@ ngx_rtmp_record_init(ngx_rtmp_session_t *s)
 
         rctx->conf = *rracf;
         rctx->file.fd = NGX_INVALID_FILE;
+        rctx->key_fd = NGX_INVALID_FILE;
     }
 
     return NGX_OK;
@@ -945,7 +1073,6 @@ ngx_rtmp_record_node_close(ngx_rtmp_session_t *s,
                            ngx_rtmp_record_rec_ctx_t *rctx)
 {
     ngx_rtmp_record_app_conf_t *rracf;
-    ngx_err_t                   err;
     void                      **app_conf;
     ngx_int_t                   rc;
     ngx_rtmp_record_done_t      v;
@@ -974,15 +1101,7 @@ ngx_rtmp_record_node_close(ngx_rtmp_session_t *s,
         }
     }
 
-    if (ngx_close_file(rctx->file.fd) == NGX_FILE_ERROR) {
-        err = ngx_errno;
-        ngx_log_error(NGX_LOG_CRIT, s->connection->log, err,
-                      "record: %V error closing file", &rracf->id);
-
-        ngx_rtmp_record_notify_error(s, rctx);
-    }
-
-    rctx->file.fd = NGX_INVALID_FILE;
+    ngx_rtmp_record_close_files(s, rctx);
 
     ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
                    "record: %V closed", &rracf->id);
@@ -1125,9 +1244,8 @@ ngx_rtmp_record_write_frame(ngx_rtmp_session_t *s,
     return NGX_OK;
 
 write_failed:
+    ngx_rtmp_record_close_files(s, rctx);
     ngx_rtmp_record_notify_error(s, rctx);
-    ngx_close_file(rctx->file.fd);
-    rctx->file.fd = NGX_INVALID_FILE;
     return NGX_ERROR;
 }
 

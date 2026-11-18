@@ -39,6 +39,8 @@ typedef struct {
     ngx_uint_t                      count;
     ngx_str_t                       path;
     ngx_str_t                       key;
+    ngx_str_t                       rec;
+    ngx_rtmp_core_app_conf_t       *selected_app;
     ngx_uint_t                      status;
     ngx_uint_t                      filter;
     ngx_str_t                       method;
@@ -108,7 +110,6 @@ static const char *
 ngx_rtmp_control_record_handler(ngx_http_request_t *r, ngx_rtmp_session_t *s)
 {
     ngx_int_t                    rc;
-    ngx_str_t                    rec;
     ngx_uint_t                   rn;
     ngx_rtmp_control_ctx_t      *ctx;
     ngx_rtmp_core_app_conf_t    *cacf;
@@ -117,16 +118,11 @@ ngx_rtmp_control_record_handler(ngx_http_request_t *r, ngx_rtmp_session_t *s)
     cacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_core_module);
     racf = cacf->app_conf[ngx_rtmp_record_module.ctx_index];
 
-    if (ngx_http_arg(r, (u_char *) "rec", sizeof("rec") - 1, &rec) != NGX_OK) {
-        rec.len = 0;
-    }
-
-    rn = ngx_rtmp_record_find(racf, &rec);
+    ctx = ngx_http_get_module_ctx(r, ngx_rtmp_control_module);
+    rn = ngx_rtmp_record_find(racf, &ctx->rec);
     if (rn == NGX_CONF_UNSET_UINT) {
         return "Recorder not found";
     }
-
-    ctx = ngx_http_get_module_ctx(r, ngx_rtmp_control_module);
 
     if (ctx->method.len == sizeof("start") - 1 &&
         ngx_strncmp(ctx->method.data, "start", ctx->method.len) == 0)
@@ -370,7 +366,9 @@ ngx_rtmp_control_walk_server(ngx_http_request_t *r,
     ngx_uint_t                  n;
     const char                 *s;
     ngx_rtmp_core_app_conf_t  **pcacf;
+    ngx_rtmp_control_ctx_t     *ctx;
 
+    ctx = ngx_http_get_module_ctx(r, ngx_rtmp_control_module);
     if (ngx_http_arg(r, (u_char *) "app", sizeof("app") - 1, &app) != NGX_OK) {
         app.len = 0;
     }
@@ -384,6 +382,9 @@ ngx_rtmp_control_walk_server(ngx_http_request_t *r,
             continue;
         }
 
+        if (app.len) {
+            ctx->selected_app = *pcacf;
+        }
         s = ngx_rtmp_control_walk_app(r, *pcacf);
         if (s != NGX_CONF_OK) {
             return s;
@@ -440,22 +441,25 @@ ngx_rtmp_control_walk(ngx_http_request_t *r, ngx_rtmp_control_handler_t h)
 static ngx_int_t
 ngx_rtmp_control_record(ngx_http_request_t *r, ngx_str_t *method)
 {
-    ngx_buf_t               *b;
-    const char              *msg;
-    ngx_chain_t              cl;
-    ngx_str_t                selector;
-    ngx_rtmp_control_ctx_t  *ctx;
+    ngx_buf_t                    *b;
+    const char                   *msg;
+    ngx_chain_t                   cl;
+    ngx_int_t                     rc;
+    ngx_uint_t                    rn;
+    ngx_str_t                     selector;
+    ngx_rtmp_control_ctx_t       *ctx;
+    ngx_rtmp_record_app_conf_t   *racf, **recorders;
 
     ctx = ngx_http_get_module_ctx(r, ngx_rtmp_control_module);
     ctx->filter = NGX_RTMP_CONTROL_FILTER_PUBLISHER;
+    ngx_http_arg(r, (u_char *) "rec", 3, &ctx->rec);
     if (ngx_http_arg(r, (u_char *) "key", 3, &ctx->key) == NGX_OK) {
         if (!ngx_rtmp_record_valid_key(&ctx->key)
             || ngx_http_arg(r, (u_char *) "name", 4, &selector) != NGX_OK
             || !selector.len
             || ngx_http_arg(r, (u_char *) "app", 3, &selector) != NGX_OK
             || !selector.len
-            || ngx_http_arg(r, (u_char *) "rec", 3, &selector) != NGX_OK
-            || !selector.len)
+            || !ctx->rec.len)
         {
             return NGX_HTTP_BAD_REQUEST;
         }
@@ -464,6 +468,30 @@ ngx_rtmp_control_record(ngx_http_request_t *r, ngx_str_t *method)
     msg = ngx_rtmp_control_walk(r, ngx_rtmp_control_record_handler);
     if (msg != NGX_CONF_OK) {
         goto error;
+    }
+
+    if (ctx->key.len && method->len == sizeof("stop") - 1
+        && ngx_memcmp(method->data, "stop", method->len) == 0)
+    {
+        /* Even an offline Stop must fence the next publish response. */
+        if (ctx->selected_app == NULL) {
+            return NGX_HTTP_NOT_FOUND;
+        }
+        racf = ctx->selected_app->app_conf[ngx_rtmp_record_module.ctx_index];
+        rn = ngx_rtmp_record_find(racf, &ctx->rec);
+        if (rn == NGX_CONF_UNSET_UINT) {
+            return NGX_HTTP_NOT_FOUND;
+        }
+        recorders = racf->rec.elts;
+        rc = ngx_rtmp_record_seal_key(recorders[rn], &ctx->key,
+                                      r->connection->log);
+        if (rc == NGX_DECLINED) {
+            return NGX_HTTP_BAD_REQUEST;
+        }
+        if (rc != NGX_OK) {
+            return rc == NGX_BUSY ? NGX_HTTP_CONFLICT
+                                  : NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
     }
 
     if (ctx->path.len == 0) {
